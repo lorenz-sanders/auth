@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+
+import os, sys, subprocess, random, json
+from datetime import datetime
+
+config = {}
+
+def load_global_configuration():
+	global config
+	config['home'] = os.environ.get('HOME')
+	config['gpghome'] = os.environ.get('GNUPGHOME')
+	if config['gpghome'] is None:
+		config['gpghome'] = '{}/.gnupg'.format(config['home'])
+	config['gpg'] = ['gpg']
+
+def load_user_configuration(username):
+	global config
+	config['username'] = username
+	config['gpglocalhome'] = '{}.gnupg'.format(config['username'])
+	config['gpglocal'] = ['gpg', '--homedir', config['gpglocalhome']]
+	try:
+		with open('{}.json'.format(config['username']), 'r') as file:
+			config = {**config, **json.load(file)}
+	except Exception as e:
+		print(e)
+		print()
+		return False
+	config['primary'] = config['chain']['master']['fingerprint']
+	config['subkey'] = [key for key in config['chain'] if key != 'master']
+	config['file'] = ['{}.{}'.format(config['username'], i) for i in ['pub', 'sec', 'rev'] + [*config['subkey']] + ['json']]
+	return True
+
+def subcommand_validate(subcommand, args):
+	if len(args) > 0:
+		for i in subcommand:
+			if args[0] in i:
+				return True
+	print('ERROR: Unkown subcommand.')
+	print()
+	print('Available subcommands:')
+	for i in subcommand:
+		for j in i:
+			print('    {}'.format(j))
+		print()
+	return False
+
+def main(args):
+	miscellaneous_subcommand = {
+		'today': today,
+		'encode': encode,
+		'decode': decode
+	}
+	user_subcommand = {
+		'info': info,
+		'renew': renew,
+		'export': export,
+		'wrap': wrap,
+		'clean': clean
+	}
+	dev_subcommand = {
+		'setup': setup
+	}
+	load_global_configuration()
+	if subcommand_validate([miscellaneous_subcommand, user_subcommand, dev_subcommand], args):
+		if args[0] in [*user_subcommand, *dev_subcommand]:
+			if len(args) < 2:
+				print('ERROR: No username specified.\n')
+			elif not load_user_configuration(args[1]):
+				print('ERROR: Fail to load configuration for {}.\n'.format(config['username']))
+			else:
+				if args[0] in user_subcommand:
+					user_subcommand[args[0]](args[2:])
+				else:
+					dev_subcommand[args[0]](args[2:])
+		else:
+			miscellaneous_subcommand[args[0]](args[1:])
+
+def today(args):
+	print(datetime.today().strftime('%y %-m %-d'))
+
+def encode(args):
+	if len(args) < 4:
+		print('ERROR: Not enough arguments.\n')
+		print('Usage: YY MM DD a-z\n')
+		return
+	n = (((int(args[0])-1)*12+int(args[1])-1)*31+int(args[2])-1)*26+ord(args[3].lower())-ord('a')
+	s = ''
+	while n:
+		c = n % 36
+		n //= 36
+		if c < 10:
+			s += chr(ord('0')+c)
+		else:
+			s += chr(ord('a')+c-10)
+	print(s[::-1])
+
+def decode(args):
+	if len(args) < 1:
+		print('ERROR: Not enough arguments.\n')
+		print('Usage: code.\n')
+		return
+	n = 0
+	for i in args[0]:
+		n = n*36+ord(i.lower())
+		if ord(i) >= ord('0') and ord(i) <= ord('9'):
+			n -= ord('0')
+		else:
+			n = n-ord('a')+10
+	ver = []
+	ver.append(chr(n%26+ord('a')))
+	n //= 26
+	ver.append(str(n%31+1))
+	n //=31
+	ver.append(str(n%12+1))
+	n //=12
+	ver.append(str(n+1))
+	print(' '.join(ver[::-1]))
+
+def info(args):
+	if not os.path.isdir(config['gpglocalhome']):
+		os.makedirs(config['gpglocalhome'], 0o700)
+		subprocess.run(config['gpglocal'] + ['--import', '{}.pub'.format(config['username'])])
+		subprocess.run(config['gpglocal'] + ['--import', '{}.sec'.format(config['username'])])
+	subprocess.run(config['gpglocal'] + ['-K', '--list-option', 'show-unusable-subkey', '--with-subkey-fingerprint'])
+
+def renew(args):
+	subcommand = {
+		'key' : renew_key,
+		'subkey': renew_subkey
+	}
+	if subcommand_validate([subcommand], args):
+		subcommand[args[0]](args[1:])
+
+def renew_key(args):
+	subprocess.run(config['gpglocal'] + ['--quick-set-expire', config['chain']['master']['fingerprint'], '{}d'.format(random.randint(
+		config['chain']['master']['renew']['min'], config['chain']['master']['renew']['max'])
+	)])
+
+def renew_subkey(args):
+	for i in config['subkey']:
+		subprocess.run(config['gpglocal'] + ['--quick-set-expire', config['primary'], '{}d'.format(random.randint(
+			config['chain'][i]['renew']['min'], config['chain'][i]['renew']['max']
+		)), config['chain'][i]['fingerprint']])
+
+def export(args):
+	gpglocalexport = config['gpglocal'] + ['--yes', '--armor']
+	subprocess.run(gpglocalexport + ['--output', '{}.pub'.format(config['username']), '--export', config['chain']['master']['fingerprint']])
+	subprocess.run(gpglocalexport + ['--output', '{}.sec'.format(config['username']), '--export-secret-key', config['chain']['master']['fingerprint']])
+	for i in config['subkey']:
+		subprocess.run(gpglocalexport + ['--output', '{}.{}'.format(config['username'], i), '--export-secret-subkey', '{}!'.format(config['chain'][i]['fingerprint'])])
+
+def wrap(args):
+	subprocess.run(['tar', '-cvf', '{}.tar'.format(config['username'])] + config['file'])
+	subprocess.run(['xz', '-9evf', '{}.tar'.format(config['username'])])
+
+def clean(args):
+	path = [config['gpglocalhome']] + config['file']
+	while path:
+		if not os.path.lexists(path[-1]):
+			path.pop()
+		elif os.path.isdir(path[-1]):
+			listdir = ['{}/{}'.format(path[-1], i) for i in os.listdir(path[-1])]
+			if listdir:
+				path.extend(listdir)
+			else:
+				os.removedirs(path.pop())
+		else:
+			os.remove(path.pop())
+
+def sieve(filename, content):
+	if os.path.isfile(filename):
+		content = content.copy()
+		againts = [[j.strip() for j in i] for i in content]
+		depth = []
+		for i in content:
+			if len(i) not in depth:
+				depth.append(len(i))
+		queue = []
+		with open(filename, 'r') as file:
+			for text in file:
+				queue.append(text.strip())
+				if len(queue) > max(depth):
+					del queue[0]
+				for i in depth:
+					try:
+						idx = againts.index(queue[-i:])
+						del againts[idx]
+						del content[idx]
+					except:
+						pass
+	return content
+
+def append(filename, content, spaced=True):
+		content = sieve(filename, content)
+		if not content:
+			return
+		lasttext = '\n'
+		if os.path.isfile(filename):
+			with open(filename, 'r') as file:
+				for lasttext in file:
+					pass
+		with open(filename, 'a') as file:
+			if lasttext[-1] != '\n':
+				print(file=file)
+			if spaced and lasttext.strip():
+				print(file=file)
+			for i in content[:-1]:
+				for j in i:
+					print(j, file=file)
+				if spaced:
+					print(file=file)
+			for j in content[-1]:
+				print(j, file=file)
+
+def prepend(filename, content, spaced=True):
+	content = sieve(filename, content)
+	if not content:
+		return
+	tmp = ''
+	firsttext = ''
+	if os.path.isfile(filename):
+		with open(filename, 'r') as file:
+			tmp = file.read()
+		firsttext = tmp.partition('\n')[0]
+	with open(filename, 'w') as file:
+		for i in content[:-1]:
+			for j in i:
+				print(j, file=file)
+			if spaced:
+				print(file=file)
+		for j in content[-1]:
+			print(j, file=file)
+		if spaced and firsttext.strip():
+			print(file=file)
+		file.write(tmp)
+
+def setup(args):
+	if not os.path.isdir(config['gpghome']):
+		os.makedirs(config['gpghome'], 0o700)
+	subprocess.run(config['gpg'] + ['--import', '{}.pub'.format(config['username'])],
+		stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	subprocess.run(config['gpg'] + ['--import', '{}.{}'.format(config['username'], config['signingkey'])],
+		stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	subprocess.run(config['gpg'] + ['--import', '{}.{}'.format(config['username'], config['ssh'])],
+		stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+	if not os.path.isdir('{}/.ssh'.format(config['home'])):
+		os.makedirs('{}/.ssh'.format(config['home']), 0o700)
+	subprocess.run(config['gpg'] + ['--output', '{}/.ssh/{}.ssh'.format(config['home'], config['username']), '--export-ssh-key', config['primary']])
+	os.chmod('{}/.ssh/{}.ssh'.format(config['home'], config['username']), 0o600)
+
+	env = os.environ.copy()
+	env['SSH_AUTH_SOCK'] = subprocess.check_output(['gpgconf', '--list-dirs', 'agent-ssh-socket'], encoding='ascii').strip()
+	subprocess.run(['ssh-add', '-L'], env=env,
+		stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	append('{}/sshcontrol'.format(config['gpghome']), [[config['chain'][config['ssh']]['keygrip']]], spaced=False)
+
+	append('{}/gpg-agent.conf'.format(config['gpghome']), [['enable-ssh-support']])
+	prepend('{}/.bashrc'.format(config['home']), [[
+		'reset() {',
+		'	gpgconf --kill gpg-agent',
+		'	gpgconf --launch gpg-agent',
+		'	unset SSH_AGENT_PID',
+		'	export SSH_AUTH_SOCK=$(gpgconf --list-dirs agent-ssh-socket)',
+		'	export GPG_TTY=$(tty)',
+		'	gpg-connect-agent updatestartuptty /bye',
+		'}'
+	]])
+
+	prepend('{}/.ssh/config'.format(config['home']), [[
+		'Host *.{}'.format(config['username']),
+		'	IdentityFile ~/.ssh/{}.ssh'.format(config['username'])
+	]])
+	append('{}/.ssh/config'.format(config['home']), [
+		[
+			'Host github.*',
+			'	HostName github.com',
+			'	User git'
+		],
+		[
+			'Host *',
+			'	IdentitiesOnly yes'
+		]
+	])
+
+	if not os.path.isdir('{}/.config/git'.format(config['home'])):
+		os.makedirs('{}/.config/git'.format(config['home']))
+	prepend('{}/.config/git/config'.format(config['home']), [[
+		'[user]',
+		'	name       = {}'.format(config['name']),
+		'	email      = {}'.format(config['email']),
+		'	signingkey = {}'.format(config['chain'][config['signingkey']]['fingerprint'])
+	]])
+	append('{}/.config/git/config'.format(config['home']), [[
+		'[url "github.{}:{}"]'.format(config['username'], config['github']),
+		'	pushInsteadOf = https://github.com/{}'.format(config['github'])
+	]])
+
+	print('Change trust to ultimate for {}? [y/n] '.format(config['username']), end='')
+	if input().lower() == 'y':
+		subprocess.run(config['gpg'] + ['--command-fd', '0', '--edit-key', config['primary'], 'trust'], input='5\ny\n', encoding='ascii')
+
+	print('Change password for {}? [y/n] '.format(config['username']), end='')
+	if input().lower() == 'y':
+		subprocess.run(config['gpg'] + ['--edit-key', config['primary'], 'passwd'])
+
+if __name__ == '__main__':
+	main(sys.argv[1:])
