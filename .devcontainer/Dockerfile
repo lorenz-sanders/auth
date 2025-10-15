@@ -14,8 +14,8 @@ RUN apt-get -y dist-upgrade && \
 RUN apt-get -y install python3 xz-utils
 COPY 'remove' '/usr/local/bin/remove'
 
-COPY '.remove' '/etc/skel'
-COPY '.vimrc' '/etc/skel'
+COPY --chmod=644 '.remove' '/etc/skel'
+COPY --chmod=644 '.vimrc' '/etc/skel'
 ARG username='dev'
 RUN sed -i '/PS1.*\\\$/s/\\\$/\\n\0/' '/etc/skel/.bashrc' && \
     useradd "${username}" -ms '/bin/bash'
